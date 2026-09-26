@@ -372,3 +372,188 @@ def test_label_preview_validation_matches_save(client):
     after = client.get(f"/recipes/{recipe['id']}").json()
     assert after["name"] == "霜"
     assert [e["ref_id"] for e in after["entries"]] == [butter["id"]]
+
+
+# ---------- 过敏原截断方案（最小命中集） ----------
+
+def test_allergen_cut_shared_sub_recipe_entry_covers_all_instances(client):
+    """共用子配方中的条目只停用一次，即覆盖其所有引用实例。"""
+    flour, butter, _, cream, cookie = _build_sample(client)
+    butter_entry = cream["entries"][0]["id"]  # 黄油霜中的黄油条目
+
+    before = client.get(f"/recipes/{cookie['id']}").json()
+    resp = client.post(f"/recipes/{cookie['id']}/allergen-cut",
+                       json={"allergen": "乳"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["recipe_id"] == cookie["id"]
+    assert data["allergen"] == "乳"
+    # 停用子配方中的黄油条目一次，两条引用路径都被截断
+    assert data["entry_ids"] == [butter_entry]
+    assert data["cut_path_count"] == 2
+    covered = data["entries"][0]["covered_paths"]
+    assert len(covered) == 2
+    assert all(p["ingredient_id"] == butter["id"] for p in covered)
+    assert all(p["path"][-1] == butter_entry for p in covered)
+    assert len({p["path"][0] for p in covered}) == 2  # 两次引用各占一条路径
+
+    # 只读：配方数据不变
+    assert client.get(f"/recipes/{cookie['id']}").json() == before
+
+
+def test_allergen_cut_prefers_root_entries_when_fewer(client):
+    """子配方被引用两次且含 3 个过敏原原料：停用 2 个根条目优于 3 个子条目。"""
+    nut = make_ingredient(client, "杏仁", ["坚果"])
+    mix = make_recipe(client, "坚果碎", [
+        {"ref_type": "ingredient", "ref_id": nut["id"]},
+        {"ref_type": "ingredient", "ref_id": nut["id"]},
+        {"ref_type": "ingredient", "ref_id": nut["id"]},
+    ])
+    cake = make_recipe(client, "蛋糕", [
+        {"ref_type": "recipe", "ref_id": mix["id"]},
+        {"ref_type": "recipe", "ref_id": mix["id"]},
+    ])
+
+    data = client.post(f"/recipes/{cake['id']}/allergen-cut",
+                       json={"allergen": "坚果"}).json()
+    root_entry_ids = [e["id"] for e in cake["entries"]]
+    assert data["entry_ids"] == sorted(root_entry_ids)  # 2 < 3，选根条目
+    assert data["cut_path_count"] == 6
+
+
+def test_allergen_cut_tie_breaks_by_lexicographic_entry_ids(client):
+    """同样数量时，按升序条目编号列表的字典序取最小。"""
+    nut = make_ingredient(client, "杏仁", ["坚果"])
+    peanut = make_ingredient(client, "花生", ["坚果"])
+    # 子配方含 2 个过敏原条目（ENT-000001/2），主配方引用两次（ENT-000003/4）
+    mix = make_recipe(client, "坚果碎", [
+        {"ref_type": "ingredient", "ref_id": nut["id"]},
+        {"ref_type": "ingredient", "ref_id": peanut["id"]},
+    ])
+    cake = make_recipe(client, "蛋糕", [
+        {"ref_type": "recipe", "ref_id": mix["id"]},
+        {"ref_type": "recipe", "ref_id": mix["id"]},
+    ])
+
+    data = client.post(f"/recipes/{cake['id']}/allergen-cut",
+                       json={"allergen": "坚果"}).json()
+    # 两种最小方案：{子配方两条目} 或 {主配方两条目}，前者编号更小
+    sub_entry_ids = sorted(e["id"] for e in mix["entries"])
+    root_entry_ids = sorted(e["id"] for e in cake["entries"])
+    assert sub_entry_ids < root_entry_ids
+    assert data["entry_ids"] == sub_entry_ids
+    assert data["cut_path_count"] == 4
+
+
+def test_allergen_cut_empty_when_allergen_absent(client):
+    """空路径集合返回空方案。"""
+    _build_sample(client)  # 只含 乳、麸质
+    recipes = client.get("/recipes").json()
+    cookie_id = recipes[1]["id"]
+
+    data = client.post(f"/recipes/{cookie_id}/allergen-cut",
+                       json={"allergen": "花生"}).json()
+    assert data["entry_ids"] == []
+    assert data["entries"] == []
+    assert data["cut_path_count"] == 0
+
+
+def test_allergen_cut_empty_recipe_gives_empty_plan(client):
+    recipe = make_recipe(client, "空配方", [])
+    data = client.post(f"/recipes/{recipe['id']}/allergen-cut",
+                       json={"allergen": "乳"}).json()
+    assert data["entry_ids"] == []
+    assert data["entries"] == []
+    assert data["cut_path_count"] == 0
+
+
+def test_allergen_cut_unknown_recipe_404(client):
+    resp = client.post("/recipes/REC-9999/allergen-cut", json={"allergen": "乳"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "RECIPE_NOT_FOUND"
+
+
+def test_allergen_cut_blank_allergen_rejected(client):
+    recipe = make_recipe(client, "空配方", [])
+    resp = client.post(f"/recipes/{recipe['id']}/allergen-cut",
+                       json={"allergen": "   "})
+    assert resp.status_code == 422
+
+
+def test_allergen_cut_too_many_candidates_422(client):
+    """候选条目数超过 24 -> 422 并说明规模。"""
+    milk = make_ingredient(client, "牛奶", ["乳"])
+    recipe = make_recipe(client, "大配方", [
+        {"ref_type": "ingredient", "ref_id": milk["id"]} for _ in range(25)
+    ])
+
+    resp = client.post(f"/recipes/{recipe['id']}/allergen-cut",
+                       json={"allergen": "乳"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["code"] == "CUT_PROBLEM_TOO_LARGE"
+    assert detail["path_count"] == 25
+    assert detail["candidate_count"] == 25
+    assert detail["max_paths"] == 64
+    assert detail["max_candidates"] == 24
+
+
+def test_allergen_cut_too_many_paths_422(client):
+    """路径总数超过 64 -> 422（候选条目数未超也一样拒绝）。"""
+    milk = make_ingredient(client, "牛奶", ["乳"])
+    sub = make_recipe(client, "奶基底", [
+        {"ref_type": "ingredient", "ref_id": milk["id"]} for _ in range(9)
+    ])
+    recipe = make_recipe(client, "大配方", [
+        {"ref_type": "recipe", "ref_id": sub["id"]} for _ in range(8)
+    ])  # 9 × 8 = 72 条路径，候选条目 9 + 8 = 17
+
+    resp = client.post(f"/recipes/{recipe['id']}/allergen-cut",
+                       json={"allergen": "乳"})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["code"] == "CUT_PROBLEM_TOO_LARGE"
+    assert detail["path_count"] == 72
+    assert detail["candidate_count"] == 17
+
+
+def test_allergen_cut_at_limits_still_solved(client):
+    """64 条路径、16 个候选条目（上限内）仍可求出全局最小解。"""
+    milk = make_ingredient(client, "牛奶", ["乳"])
+    sub = make_recipe(client, "奶基底", [
+        {"ref_type": "ingredient", "ref_id": milk["id"]} for _ in range(8)
+    ])
+    recipe = make_recipe(client, "大配方", [
+        {"ref_type": "recipe", "ref_id": sub["id"]} for _ in range(8)
+    ])  # 8 × 8 = 64 条路径
+
+    resp = client.post(f"/recipes/{recipe['id']}/allergen-cut",
+                       json={"allergen": "乳"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 最小方案 8 条：子配方 8 条目（ENT 编号更小）优于主配方 8 条目
+    sub_entry_ids = sorted(e["id"] for e in sub["entries"])
+    assert data["entry_ids"] == sub_entry_ids
+    assert data["cut_path_count"] == 64
+    # 每个条目覆盖 8 条路径，合计去重后 64 条
+    assert all(len(e["covered_paths"]) == 8 for e in data["entries"])
+
+
+def test_allergen_cut_does_not_modify_data(client):
+    """整个流程只读：配方与原料数据均不变。"""
+    flour, butter, _, cream, cookie = _build_sample(client)
+    recipes_before = client.get("/recipes").json()
+    cookie_before = client.get(f"/recipes/{cookie['id']}").json()
+    cream_before = client.get(f"/recipes/{cream['id']}").json()
+    ingredients_before = client.get("/ingredients").json()
+
+    for allergen in ("乳", "麸质", "不存在"):
+        resp = client.post(f"/recipes/{cookie['id']}/allergen-cut",
+                           json={"allergen": allergen})
+        assert resp.status_code == 200, resp.text
+
+    assert client.get("/recipes").json() == recipes_before
+    assert client.get(f"/recipes/{cookie['id']}").json() == cookie_before
+    assert client.get(f"/recipes/{cream['id']}").json() == cream_before
+    assert client.get("/ingredients").json() == ingredients_before

@@ -164,3 +164,43 @@ class LabelPreviewOut(BaseModel):
     added_allergens: list[AllergenChange]    # 新增（before 为空）
     removed_allergens: list[AllergenChange]  # 移除（after 为空）
     changed_allergens: list[AllergenChange]  # 仍存在，但来源原料或路径变化
+
+
+# ---------- 过敏原截断方案（最小命中集，只读） ----------
+
+class AllergenCutIn(BaseModel):
+    """目标过敏原：找出最少需要停用的条目，截断所有含它的原料路径。"""
+
+    allergen: str = Field(min_length=1, max_length=100)
+
+    @field_validator("allergen")
+    @classmethod
+    def _strip_allergen(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("allergen 不能为空")
+        return v
+
+
+class AllergenCutPath(BaseModel):
+    """一条被截断的原料路径（条目编号序列 + 来源原料）。"""
+
+    path: list[str]
+    ingredient_id: str
+    ingredient_name: str
+
+
+class AllergenCutEntry(BaseModel):
+    """方案中一个待停用条目，及其停用后覆盖（截断）的全部原料路径。"""
+
+    entry_id: str
+    covered_paths: list[AllergenCutPath]
+
+
+class AllergenCutOut(BaseModel):
+    recipe_id: str
+    recipe_name: str
+    allergen: str
+    entry_ids: list[str]              # 最少需要停用的条目编号（升序）
+    entries: list[AllergenCutEntry]   # 每个条目覆盖的原料路径
+    cut_path_count: int               # 被截断路径总数

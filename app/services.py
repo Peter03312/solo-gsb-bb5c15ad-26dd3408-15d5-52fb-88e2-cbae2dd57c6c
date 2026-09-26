@@ -1,4 +1,5 @@
-"""业务逻辑：登记原料、保存配方（校验 + 原子写入）、展开配方、预演标签变化。
+"""业务逻辑：登记原料、保存配方（校验 + 原子写入）、展开配方、预演标签变化、
+计算过敏原截断的最小停用方案（只读）。
 
 保存配方的规则：
 1. 所有引用的原料 / 子配方必须已存在，否则整体拒绝；
@@ -8,7 +9,11 @@
 
 标签预演（label-preview）套用与保存完全相同的校验，但只做展开与对比，
 不写入任何数据。
+
+过敏原截断（allergen-cut）复用展开结果求最小命中集，同样只读，
+不改动任何配方或原料数据。
 """
+import itertools
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -415,3 +420,121 @@ def preview_label_change(db: Session, recipe_id: str, payload: RecipeIn) -> dict
         "removed_allergens": removed,
         "changed_allergens": changed,
     }
+
+
+# ---------- 过敏原截断方案（最小命中集，只读） ----------
+
+# 全局最小命中集的求解规模上限：超出即拒绝（422），避免指数级求解拖垮服务
+CUT_MAX_PATHS = 64       # 含目标过敏原、需要截断的原料路径总数上限
+CUT_MAX_CANDIDATES = 24  # 这些路径上出现的候选条目数上限
+
+
+def _min_hitting_set(paths: list[list[str]], candidates: list[str]) -> list[str]:
+    """求全局最小命中集；同样数量时按升序条目编号列表的字典序取最小。
+
+    candidates 必须已按升序排列。实现要点：
+    1. 只含一个候选条目的路径，其条目在任何解中都不可少，先行收编为必选项；
+       必选项存在于所有解中，不影响剩余部分的字典序比较；
+    2. 其余按组合大小从小到大枚举（下界由互不相交路径数给出），
+       同大小内按编号升序的字典序枚举，第一个命中全部剩余路径的组合即答案。
+    """
+    bit = {entry_id: 1 << i for i, entry_id in enumerate(candidates)}
+
+    # 路径 -> 候选条目位掩码（相同掩码去重，命中其一即命中全部）
+    masks: list[int] = []
+    seen: set[int] = set()
+    for path in paths:
+        mask = 0
+        for entry_id in path:
+            mask |= bit[entry_id]
+        if mask not in seen:
+            seen.add(mask)
+            masks.append(mask)
+
+    # 1. 必选项：单条目路径要求的条目
+    forced: set[str] = set()
+    for mask in masks:
+        if mask and not mask & (mask - 1):  # 该路径只有一个候选条目可截断
+            forced.add(candidates[mask.bit_length() - 1])
+    forced_mask = 0
+    for entry_id in forced:
+        forced_mask |= bit[entry_id]
+
+    rest_masks = [m for m in masks if not m & forced_mask]
+    rest_candidates = [c for c in candidates if c not in forced]
+
+    # 2. 下界：互不相交的路径各需一个不同条目，用于跳过不可能的组合大小
+    lower = 0
+    used = 0
+    for mask in sorted(rest_masks, key=lambda m: m.bit_count()):
+        if not mask & used:
+            lower += 1
+            used |= mask
+
+    for size in range(lower, len(rest_candidates) + 1):
+        for combo in itertools.combinations(rest_candidates, size):
+            combo_mask = 0
+            for entry_id in combo:
+                combo_mask |= bit[entry_id]
+            if all(m & combo_mask for m in rest_masks):
+                return sorted(forced | set(combo))
+    return sorted(forced)  # 候选全集必然命中所有路径，不会走到这里
+
+
+def plan_allergen_cut(db: Session, recipe_id: str, allergen: str) -> dict:
+    """最小停用方案：找出最少需要停用的条目，截断全部含目标过敏原的原料路径。
+
+    只读操作：复用配方展开结果取完整条目路径，不改动任何配方或原料数据。
+    条目编号全局唯一：同一子配方被多处引用时，其条目出现在每条引用路径中，
+    停用一次即覆盖所有引用实例——这正是按条目编号求命中集的含义。
+    """
+    expansion = expand_recipe(db, recipe_id)  # 配方不存在时抛 404
+
+    # 含目标过敏原的原料路径 = 需要截断的路径
+    targets = [p for p in expansion["paths"] if allergen in p["allergens"]]
+    plan = {
+        "recipe_id": expansion["recipe_id"],
+        "recipe_name": expansion["recipe_name"],
+        "allergen": allergen,
+        "entry_ids": [],
+        "entries": [],
+        "cut_path_count": 0,
+    }
+    if not targets:  # 空路径集合 -> 空方案
+        return plan
+
+    candidates = sorted({entry_id for p in targets for entry_id in p["path"]})
+    if len(targets) > CUT_MAX_PATHS or len(candidates) > CUT_MAX_CANDIDATES:
+        raise ApiError(
+            422, "CUT_PROBLEM_TOO_LARGE",
+            "命中集求解规模超出上限（路径总数 ≤ "
+            f"{CUT_MAX_PATHS}、候选条目数 ≤ {CUT_MAX_CANDIDATES}），"
+            "请缩小配方规模或拆分目标",
+            {
+                "path_count": len(targets),
+                "candidate_count": len(candidates),
+                "max_paths": CUT_MAX_PATHS,
+                "max_candidates": CUT_MAX_CANDIDATES,
+            },
+        )
+
+    chosen = _min_hitting_set([p["path"] for p in targets], candidates)
+
+    entries = []
+    cut_indices: set[int] = set()
+    for entry_id in chosen:
+        covered = []
+        for i, p in enumerate(targets):
+            if entry_id in p["path"]:
+                cut_indices.add(i)
+                covered.append({
+                    "path": p["path"],
+                    "ingredient_id": p["ingredient_id"],
+                    "ingredient_name": p["ingredient_name"],
+                })
+        entries.append({"entry_id": entry_id, "covered_paths": covered})
+
+    plan["entry_ids"] = chosen
+    plan["entries"] = entries
+    plan["cut_path_count"] = len(cut_indices)
+    return plan

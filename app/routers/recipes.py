@@ -6,7 +6,15 @@ from sqlalchemy.orm import Session
 from app import services
 from app.database import get_db
 from app.models import Recipe, RecipeEntry
-from app.schemas import ExpansionOut, LabelPreviewOut, RecipeIn, RecipeOut, RecipeSummary
+from app.schemas import (
+    AllergenCutIn,
+    AllergenCutOut,
+    ExpansionOut,
+    LabelPreviewOut,
+    RecipeIn,
+    RecipeOut,
+    RecipeSummary,
+)
 
 router = APIRouter(prefix="/recipes", tags=["配方"])
 
@@ -58,3 +66,10 @@ def preview_label_change(recipe_id: str, payload: RecipeIn, db: Session = Depend
             summary="展开全部引用路径并按过敏原汇总来源（标签核对）")
 def get_expansion(recipe_id: str, db: Session = Depends(get_db)):
     return services.expand_recipe(db, recipe_id)
+
+
+@router.post("/{recipe_id}/allergen-cut", response_model=AllergenCutOut,
+             summary="最小停用方案：截断含目标过敏原的全部原料路径（只读，不写入）")
+def plan_allergen_cut(recipe_id: str, payload: AllergenCutIn,
+                      db: Session = Depends(get_db)):
+    return services.plan_allergen_cut(db, recipe_id, payload.allergen)
