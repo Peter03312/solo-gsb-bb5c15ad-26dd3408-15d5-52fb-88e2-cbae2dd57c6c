@@ -139,6 +139,38 @@ class ExpansionOut(BaseModel):
     allergen_summary: list[AllergenSummaryItem]
 
 
+# ---------- 过敏原截断方案 ----------
+
+class AllergenCutIn(BaseModel):
+    """截断目标：需要从配方中彻底清除来源的过敏原。"""
+
+    allergen: str = Field(min_length=1, max_length=100)
+
+    @field_validator("allergen")
+    @classmethod
+    def _strip_allergen(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("allergen 不能为空")
+        return v
+
+
+class AllergenCutEntry(BaseModel):
+    """方案中的一个待停用条目，以及停用后由它截断的原料路径。"""
+
+    entry_id: str
+    covered_paths: list[AllergenSource]  # 经过该条目、含目标过敏原的原料路径
+
+
+class AllergenCutOut(BaseModel):
+    recipe_id: str
+    recipe_name: str
+    allergen: str
+    entry_ids: list[str]          # 最少需停用的条目编号（升序）
+    cuts: list[AllergenCutEntry]  # 与 entry_ids 同序，逐项列出覆盖的原料路径
+    cut_path_count: int           # 被截断路径总数（去重）
+
+
 # ---------- 标签变化预演 ----------
 
 class AllergenSourceRef(BaseModel):

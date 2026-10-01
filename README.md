@@ -1,6 +1,6 @@
 # 食品工坊配方标签核查 API
 
-供小型食品工坊使用的配方标签核对服务：登记原料及其过敏原，用**带独立条目编号**的原料或子配方组成配方；保存配方时校验引用与循环；查询时展开全部引用路径并按过敏原汇总每条来源路径，用于成品标签核对。改动配方前还可用**标签预演**接口，在不写入数据库的前提下预演整体替换后的过敏原变化，判断是否需要重印标签。
+供小型食品工坊使用的配方标签核对服务：登记原料及其过敏原，用**带独立条目编号**的原料或子配方组成配方；保存配方时校验引用与循环；查询时展开全部引用路径并按过敏原汇总每条来源路径，用于成品标签核对。改动配方前还可用**标签预演**接口，在不写入数据库的前提下预演整体替换后的过敏原变化，判断是否需要重印标签；需要彻底移除某过敏原时，可用**过敏原截断**接口（只读）算出最少需要停用哪些条目，才能让该过敏原的全部来源路径都被截断。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · SQLite
 
@@ -55,6 +55,7 @@ pytest                                       # 运行测试
 | POST | `/recipes/{id}/label-preview` | **标签预演**：接收与整体替换相同的请求，校验相同但**不写入数据库**，返回替换前后的过敏原变化 |
 | GET | `/recipes` / `/recipes/{id}` | 查询配方及其条目 |
 | GET | `/recipes/{id}/expansion` | **标签核对**：展开全部引用路径，按过敏原汇总来源 |
+| POST | `/recipes/{id}/allergen-cut` | **过敏原截断**：计算最少停用条目方案，截断某过敏原的全部来源路径（只读，不写库） |
 
 ## 保存规则（重点）
 
@@ -77,6 +78,26 @@ pytest                                       # 运行测试
 | `changed_allergens` | 仍存在、但来源原料或路径发生变化的过敏原 |
 
 每项都列出变更前后的来源原料与路径（`before` / `after`），便于判断是否需要重印标签。路径标识由**每层条目位置**依次组成（如 `[2, 1]` 表示「本配方第 2 行 → 子配方第 1 行」）；同一子配方被重复引用时，每次引用位置不同，各自保留为不同来源。
+
+## 过敏原截断（最少停用条目方案）
+
+`POST /recipes/{id}/allergen-cut` 接收 `{"allergen": "乳"}`，复用展开结果找出**最少需要停用的配方条目**，使该配方所有含该过敏原的原料路径均被截断。**只读接口**，不修改任何配方或原料数据。
+
+规则：
+
+- 条目在共用子配方中代表同一修改：停用一次即截断经过它的**所有**引用实例，因此问题等价于在「含目标过敏原的路径集合」上求**全局最小命中集**；
+- 规模上限：含该过敏原的原料路径总数 ≤ **64** 且涉及的不同条目数 ≤ **24** 时精确求解；超过上限返回 `422 SCALE_LIMIT_EXCEEDED`，`detail` 中附带 `path_count` / `candidate_count` 及对应上限（`max_paths` / `max_candidates`）；
+- 最小数量相同的多个方案，按「升序条目编号列表」的字典序取最小；
+- 该过敏原没有任何来源路径时返回空方案（`entry_ids` 为空、`cut_path_count` 为 0）；
+- 配方不存在返回 `404 RECIPE_NOT_FOUND`。
+
+响应字段：
+
+| 字段 | 含义 |
+|---|---|
+| `entry_ids` | 最少需停用的条目编号（升序） |
+| `cuts` | 与 `entry_ids` 同序；每项列出该条目截断的含目标过敏原的原料路径（条目编号路径 + 来源原料） |
+| `cut_path_count` | 被截断路径总数（按路径去重） |
 
 ## 使用示例
 
@@ -120,6 +141,10 @@ curl -X POST $B/recipes/REC-0002/label-preview -H 'Content-Type: application/jso
     {"ref_type":"recipe","ref_id":"REC-0001","quantity":1,"unit":"份"},
     {"ref_type":"ingredient","ref_id":"ING-0004","quantity":50,"unit":"g"}
   ]}'
+
+# 6. 过敏原截断：最少停用哪些条目，可让「乳」的全部来源路径被截断（只读）
+curl -X POST $B/recipes/REC-0002/allergen-cut -H 'Content-Type: application/json' \
+  -d '{"allergen":"乳"}'
 ```
 
 展开结果中，每条来源路径由条目编号依次记录（如 `["ENT-000004","ENT-000001"]` 表示「曲奇第 2 行 → 黄油霜第 1 行 → 黄油」）；`allergen_summary` 按过敏原分组，同一子配方使用两次会列出两条独立来源路径：
@@ -168,6 +193,26 @@ curl -X POST $B/recipes/REC-0002/label-preview -H 'Content-Type: application/jso
 
 即：新增「花生」、移除「麸质」；「乳」仍在，但来源从两条路径（黄油霜被引用两次）变为一条——标签需要重印。确认无误后再用 `PUT /recipes/REC-0002` 正式保存同样的请求体。
 
+第 6 步的截断方案响应如下（数据库中的配方与原料保持不变）：
+
+```json
+{
+  "recipe_id": "REC-0002",
+  "recipe_name": "曲奇",
+  "allergen": "乳",
+  "entry_ids": ["ENT-000001"],
+  "cuts": [
+    {"entry_id": "ENT-000001", "covered_paths": [
+      {"path": ["ENT-000004", "ENT-000001"], "ingredient_id": "ING-0001", "ingredient_name": "黄油"},
+      {"path": ["ENT-000005", "ENT-000001"], "ingredient_id": "ING-0001", "ingredient_name": "黄油"}
+    ]}
+  ],
+  "cut_path_count": 2
+}
+```
+
+即：黄油在共用子配方「黄油霜」中只有 `ENT-000001` 一个条目，停用这一次即同时截断「黄油霜 ×2」产生的两条「乳」来源路径。
+
 ## 项目结构
 
 ```
@@ -176,9 +221,9 @@ app/
 ├── database.py        # 引擎 / 会话 / 建表（DATABASE_URL 可配置）
 ├── models.py          # Ingredient / Recipe / RecipeEntry / 发号器
 ├── schemas.py         # 请求与响应模型
-├── services.py        # 校验（引用、循环）、原子保存、展开汇总、标签预演对比
+├── services.py        # 校验（引用、循环）、原子保存、展开汇总、过敏原截断（最小命中集）、标签预演对比
 └── routers/           # /ingredients、/recipes 路由
-tests/test_api.py      # 18 个行为测试（校验、循环、原子性、展开、标签预演）
+tests/test_api.py      # 27 个行为测试（校验、循环、原子性、展开、过敏原截断、标签预演）
 Dockerfile             # python:3.12-slim，构建时安装依赖
 docker-compose.yml     # 一条命令启动，端口与数据卷在此配置
 ```

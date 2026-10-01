@@ -1,4 +1,5 @@
-"""业务逻辑：登记原料、保存配方（校验 + 原子写入）、展开配方、预演标签变化。
+"""业务逻辑：登记原料、保存配方（校验 + 原子写入）、展开配方、
+计算过敏原截断方案（最小命中集）、预演标签变化。
 
 保存配方的规则：
 1. 所有引用的原料 / 子配方必须已存在，否则整体拒绝；
@@ -330,6 +331,160 @@ def expand_recipe(db: Session, recipe_id: str) -> dict:
             {"allergen": allergen, "sources": summary[allergen]}
             for allergen in sorted(summary)
         ],
+    }
+
+
+# ---------- 过敏原截断方案 ----------
+
+# 精确求解最小命中集的规模上限，超过即拒绝（422），避免指数级搜索失控
+MAX_CUT_PATHS = 64       # 含目标过敏原的原料路径总数上限
+MAX_CUT_CANDIDATES = 24  # 这些路径涉及的不同条目数上限
+
+
+def _min_hitting_set(path_sets: list[frozenset[str]]) -> list[str]:
+    """全局最小命中集：用最少的条目覆盖所有路径。
+
+    返回升序条目编号列表；存在多个同样最小的方案时，
+    按「升序条目编号列表」的字典序取最小。
+    调用方需保证路径数与候选条目数已在规模上限内。
+    """
+    # 每个候选条目覆盖哪些路径（位掩码）
+    entry_cover: dict[str, int] = {}
+    for i, entries in enumerate(path_sets):
+        for entry in entries:
+            entry_cover[entry] = entry_cover.get(entry, 0) | (1 << i)
+
+    full = (1 << len(path_sets)) - 1
+    path_entries = [sorted(entries) for entries in path_sets]
+
+    # conflict[i]：与第 i 条路径共享条目（含自身）的路径集合，用于下界估计
+    conflict = [0] * len(path_sets)
+    for mask in entry_cover.values():
+        for i in range(len(path_sets)):
+            if (mask >> i) & 1:
+                conflict[i] |= mask
+
+    def lower_bound(uncovered: int) -> int:
+        """还需的条目数下界：贪心取互不相交的未覆盖路径，每条至少占一个条目。"""
+        count = 0
+        remaining = uncovered
+        while remaining:
+            i = (remaining & -remaining).bit_length() - 1
+            count += 1
+            remaining &= ~conflict[i]
+        return count
+
+    def feasible(uncovered: int, budget: int, allowed: frozenset[str]) -> bool:
+        """仅用 allowed 中的条目，能否用不超过 budget 个条目覆盖 uncovered。"""
+        if not uncovered:
+            return True
+        if budget <= 0 or lower_bound(uncovered) > budget:
+            return False
+        # 选可用条目最少的未覆盖路径分支，尽快暴露不可行
+        options: list[str] | None = None
+        remaining = uncovered
+        while remaining:
+            bit = remaining & -remaining
+            i = bit.bit_length() - 1
+            remaining ^= bit
+            opts = [e for e in path_entries[i] if e in allowed]
+            if not opts:
+                return False  # 该路径没有可用条目，无法覆盖
+            if options is None or len(opts) < len(options):
+                options = opts
+                if len(opts) == 1:
+                    break
+        return any(feasible(uncovered & ~entry_cover[e], budget - 1, allowed)
+                   for e in options)
+
+    candidates = sorted(entry_cover)
+
+    # 第一阶段：迭代加深求最小条目数
+    size = 0
+    while not feasible(full, size, frozenset(candidates)):
+        size += 1
+
+    # 第二阶段：在最小数量下，逐位贪心构造字典序最小的升序列表
+    chosen: list[str] = []
+    uncovered = full
+    for remaining in range(size, 0, -1):
+        last = chosen[-1] if chosen else ""
+        for entry in candidates:
+            if entry <= last or not entry_cover[entry] & uncovered:
+                continue
+            # 存在以「chosen + [entry]」为升序前缀的最小方案时，entry 即可选定
+            if feasible(uncovered & ~entry_cover[entry], remaining - 1,
+                        frozenset(c for c in candidates if c > entry)):
+                chosen.append(entry)
+                uncovered &= ~entry_cover[entry]
+                break
+
+    return chosen
+
+
+def allergen_cut(db: Session, recipe_id: str, allergen: str) -> dict:
+    """只读地计算「截断某过敏原全部来源路径」所需的最少停用条目方案。
+
+    复用配方展开结果：每条原料路径由依次经过的条目编号组成。
+    条目在共用子配方中是同一份修改——停用一个条目即截断经过它的所有路径，
+    因此问题等价于在「含目标过敏原的路径集合」上求最小命中集。
+    全程只读，不修改任何配方或原料数据。
+    """
+    root = get_recipe_or_404(db, recipe_id)
+    recipes, ingredients, entries_by_recipe = _load_graph(db)
+    leaves = _expand_paths(root.id, entries_by_recipe.get(root.id, []),
+                           entries_by_recipe, recipes, ingredients)
+
+    # 含目标过敏原的原料路径（每条 = 依次经过的条目编号 + 来源原料）
+    targets = [
+        {
+            "path": [s["entry_id"] for s in leaf["steps"]],
+            "ingredient_id": leaf["ingredient_id"],
+            "ingredient_name": leaf["ingredient_name"],
+        }
+        for leaf in leaves
+        if allergen in leaf["allergens"]
+    ]
+
+    if not targets:  # 空路径集合 -> 空方案
+        return {
+            "recipe_id": root.id,
+            "recipe_name": root.name,
+            "allergen": allergen,
+            "entry_ids": [],
+            "cuts": [],
+            "cut_path_count": 0,
+        }
+
+    candidates = sorted({e for t in targets for e in t["path"]})
+    if len(targets) > MAX_CUT_PATHS or len(candidates) > MAX_CUT_CANDIDATES:
+        raise ApiError(
+            422, "SCALE_LIMIT_EXCEEDED",
+            f"命中集规模超出可精确求解范围：含该过敏原的原料路径 {len(targets)} 条"
+            f"（上限 {MAX_CUT_PATHS}），涉及条目 {len(candidates)} 个"
+            f"（上限 {MAX_CUT_CANDIDATES}）",
+            {"path_count": len(targets), "candidate_count": len(candidates),
+             "max_paths": MAX_CUT_PATHS, "max_candidates": MAX_CUT_CANDIDATES},
+        )
+
+    chosen = _min_hitting_set([frozenset(t["path"]) for t in targets])
+
+    cuts = [
+        {
+            "entry_id": entry,
+            "covered_paths": [t for t in targets if entry in t["path"]],
+        }
+        for entry in chosen
+    ]
+
+    return {
+        "recipe_id": root.id,
+        "recipe_name": root.name,
+        "allergen": allergen,
+        "entry_ids": chosen,
+        "cuts": cuts,
+        # 方案保证截断全部目标路径；按路径去重计数
+        "cut_path_count": len({tuple(t["path"]) for t in targets}),
     }
 
 
